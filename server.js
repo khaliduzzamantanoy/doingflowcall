@@ -13,94 +13,96 @@ const io = socketIo(server, {
 });
 
 // Serve static files
-app.use(express.static("public"));
+app.use(express.static(path.join(__dirname, "public")));
 
 // Store active rooms and users
 const rooms = new Map();
 const users = new Map();
 
-// Generate random 6-digit room codes
+// Generate random 6-digit room code
 function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-// WebRTC signaling
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  // Join room
-  socket.on("join-room", (data) => {
-    try {
-      const { roomCode, username } = data;
+  // Create room
+  socket.on("create-room", (data) => {
+    const { userName } = data;
+    let roomCode;
 
-      console.log(`${username} attempting to join room ${roomCode}`);
+    // Generate unique room code
+    do {
+      roomCode = generateRoomCode();
+    } while (rooms.has(roomCode));
 
-      if (!rooms.has(roomCode)) {
-        rooms.set(roomCode, new Set());
-      }
+    // Create room
+    rooms.set(roomCode, {
+      host: socket.id,
+      users: new Map([[socket.id, { name: userName, socketId: socket.id }]]),
+      createdAt: new Date(),
+    });
 
-      const room = rooms.get(roomCode);
-      room.add(socket.id);
+    users.set(socket.id, { roomCode, userName });
+    socket.join(roomCode);
 
-      users.set(socket.id, { username, roomCode });
-      socket.join(roomCode);
-
-      console.log(`${username} joined room ${roomCode}`);
-
-      // Notify others in the room
-      socket.to(roomCode).emit("user-joined", {
-        userId: socket.id,
-        username: username,
-      });
-
-      // Send existing users to the new user
-      const existingUsers = Array.from(room)
-        .filter((id) => id !== socket.id)
-        .map((id) => ({
-          userId: id,
-          username: users.get(id)?.username || "Unknown",
-        }));
-
-      socket.emit("existing-users", existingUsers);
-      socket.emit("room-joined", { roomCode, userCount: room.size });
-    } catch (error) {
-      console.error("Error joining room:", error);
-      socket.emit("error", { message: "Failed to join room" });
-    }
+    socket.emit("room-created", { roomCode, userName });
+    console.log(`Room ${roomCode} created by ${userName}`);
   });
 
-  // Create new room
-  socket.on("create-room", (data) => {
-    try {
-      const { username } = data;
-      const roomCode = generateRoomCode();
+  // Join room
+  socket.on("join-room", (data) => {
+    const { roomCode, userName } = data;
 
-      console.log(`Creating room for ${username}, code: ${roomCode}`);
-
-      rooms.set(roomCode, new Set([socket.id]));
-      users.set(socket.id, { username, roomCode });
-      socket.join(roomCode);
-
-      console.log(`${username} created room ${roomCode}`);
-      socket.emit("room-created", { roomCode });
-    } catch (error) {
-      console.error("Error creating room:", error);
-      socket.emit("error", { message: "Failed to create room" });
+    if (!rooms.has(roomCode)) {
+      socket.emit("error", { message: "Room not found" });
+      return;
     }
+
+    const room = rooms.get(roomCode);
+
+    // Check if room is full (optional limit)
+    if (room.users.size >= 10) {
+      socket.emit("error", { message: "Room is full" });
+      return;
+    }
+
+    // Add user to room
+    room.users.set(socket.id, { name: userName, socketId: socket.id });
+    users.set(socket.id, { roomCode, userName });
+    socket.join(roomCode);
+
+    // Notify user they joined successfully
+    socket.emit("room-joined", { roomCode, userName });
+
+    // Notify other users in room
+    socket.to(roomCode).emit("user-joined", {
+      userId: socket.id,
+      userName,
+      users: Array.from(room.users.values()),
+    });
+
+    // Send current users list to new user
+    socket.emit("users-list", {
+      users: Array.from(room.users.values()),
+    });
+
+    console.log(`${userName} joined room ${roomCode}`);
   });
 
   // WebRTC signaling
   socket.on("offer", (data) => {
     socket.to(data.target).emit("offer", {
       offer: data.offer,
-      caller: socket.id,
+      sender: socket.id,
     });
   });
 
   socket.on("answer", (data) => {
     socket.to(data.target).emit("answer", {
       answer: data.answer,
-      answerer: socket.id,
+      sender: socket.id,
     });
   });
 
@@ -111,36 +113,57 @@ io.on("connection", (socket) => {
     });
   });
 
+  // Mute/unmute events
+  socket.on("toggle-mute", (data) => {
+    const user = users.get(socket.id);
+    if (user) {
+      socket.to(user.roomCode).emit("user-mute-status", {
+        userId: socket.id,
+        isMuted: data.isMuted,
+      });
+    }
+  });
+
   // Handle disconnect
   socket.on("disconnect", () => {
     const user = users.get(socket.id);
+
     if (user) {
-      const { roomCode, username } = user;
+      const { roomCode } = user;
       const room = rooms.get(roomCode);
 
       if (room) {
-        room.delete(socket.id);
+        room.users.delete(socket.id);
 
-        // Clean up empty rooms
-        if (room.size === 0) {
+        // If room is empty, delete it
+        if (room.users.size === 0) {
           rooms.delete(roomCode);
+          console.log(`Room ${roomCode} deleted (empty)`);
         } else {
-          // Notify others that user left
+          // Notify other users
           socket.to(roomCode).emit("user-left", {
             userId: socket.id,
-            username: username,
+            users: Array.from(room.users.values()),
           });
+
+          // If host left, assign new host
+          if (room.host === socket.id) {
+            const newHost = room.users.keys().next().value;
+            room.host = newHost;
+            socket.to(roomCode).emit("new-host", { hostId: newHost });
+          }
         }
       }
 
       users.delete(socket.id);
-      console.log(`${username} left room ${roomCode}`);
     }
+
+    console.log("User disconnected:", socket.id);
   });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Voice chat server running on port ${PORT}`);
-  console.log(`Access at: http://localhost:${PORT}`);
+  console.log(`Local: http://localhost:${PORT}`);
 });
