@@ -19,9 +19,18 @@ app.use(express.static(path.join(__dirname, "public")));
 const rooms = new Map();
 const users = new Map();
 
-// Generate random 6-digit room code
+// Generate 6-digit room code
 function generateRoomCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Clean up empty rooms
+function cleanupRooms() {
+  for (const [roomCode, room] of rooms.entries()) {
+    if (room.users.size === 0) {
+      rooms.delete(roomCode);
+    }
+  }
 }
 
 io.on("connection", (socket) => {
@@ -30,24 +39,36 @@ io.on("connection", (socket) => {
   // Create room
   socket.on("create-room", (data) => {
     const { userName } = data;
-    let roomCode;
+    const roomCode = generateRoomCode();
 
-    // Generate unique room code
-    do {
+    // Ensure unique room code
+    while (rooms.has(roomCode)) {
       roomCode = generateRoomCode();
-    } while (rooms.has(roomCode));
+    }
 
-    // Create room
-    rooms.set(roomCode, {
-      host: socket.id,
-      users: new Map([[socket.id, { name: userName, socketId: socket.id }]]),
+    const room = {
+      code: roomCode,
+      creator: socket.id,
+      users: new Map(),
       createdAt: new Date(),
+    };
+
+    rooms.set(roomCode, room);
+    users.set(socket.id, {
+      name: userName,
+      roomCode: roomCode,
+      socketId: socket.id,
     });
 
-    users.set(socket.id, { roomCode, userName });
     socket.join(roomCode);
+    room.users.set(socket.id, {
+      name: userName,
+      socketId: socket.id,
+      isCreator: true,
+    });
 
     socket.emit("room-created", { roomCode, userName });
+
     console.log(`Room ${roomCode} created by ${userName}`);
   });
 
@@ -62,30 +83,31 @@ io.on("connection", (socket) => {
 
     const room = rooms.get(roomCode);
 
-    // Check if room is full (optional limit)
-    if (room.users.size >= 10) {
-      socket.emit("error", { message: "Room is full" });
-      return;
-    }
-
-    // Add user to room
-    room.users.set(socket.id, { name: userName, socketId: socket.id });
-    users.set(socket.id, { roomCode, userName });
-    socket.join(roomCode);
-
-    // Notify user they joined successfully
-    socket.emit("room-joined", { roomCode, userName });
-
-    // Notify other users in room
-    socket.to(roomCode).emit("user-joined", {
-      userId: socket.id,
-      userName,
-      users: Array.from(room.users.values()),
+    users.set(socket.id, {
+      name: userName,
+      roomCode: roomCode,
+      socketId: socket.id,
     });
 
-    // Send current users list to new user
-    socket.emit("users-list", {
-      users: Array.from(room.users.values()),
+    socket.join(roomCode);
+    room.users.set(socket.id, {
+      name: userName,
+      socketId: socket.id,
+      isCreator: false,
+    });
+
+    // Notify all users in room
+    const userList = Array.from(room.users.values()).map((user) => ({
+      name: user.name,
+      socketId: user.socketId,
+      isCreator: user.isCreator,
+    }));
+
+    socket.emit("room-joined", { roomCode, userName, users: userList });
+    socket.to(roomCode).emit("user-joined", {
+      userName,
+      socketId: socket.id,
+      users: userList,
     });
 
     console.log(`${userName} joined room ${roomCode}`);
@@ -93,77 +115,74 @@ io.on("connection", (socket) => {
 
   // WebRTC signaling
   socket.on("offer", (data) => {
-    socket.to(data.target).emit("offer", {
-      offer: data.offer,
-      sender: socket.id,
+    const { targetSocketId, offer } = data;
+    socket.to(targetSocketId).emit("offer", {
+      offer,
+      senderSocketId: socket.id,
     });
   });
 
   socket.on("answer", (data) => {
-    socket.to(data.target).emit("answer", {
-      answer: data.answer,
-      sender: socket.id,
+    const { targetSocketId, answer } = data;
+    socket.to(targetSocketId).emit("answer", {
+      answer,
+      senderSocketId: socket.id,
     });
   });
 
   socket.on("ice-candidate", (data) => {
-    socket.to(data.target).emit("ice-candidate", {
-      candidate: data.candidate,
-      sender: socket.id,
+    const { targetSocketId, candidate } = data;
+    socket.to(targetSocketId).emit("ice-candidate", {
+      candidate,
+      senderSocketId: socket.id,
     });
   });
 
-  // Mute/unmute events
-  socket.on("toggle-mute", (data) => {
-    const user = users.get(socket.id);
-    if (user) {
-      socket.to(user.roomCode).emit("user-mute-status", {
-        userId: socket.id,
-        isMuted: data.isMuted,
-      });
+  // Get room users
+  socket.on("get-room-users", (roomCode) => {
+    const room = rooms.get(roomCode);
+    if (room) {
+      const userList = Array.from(room.users.values()).map((user) => ({
+        name: user.name,
+        socketId: user.socketId,
+        isCreator: user.isCreator,
+      }));
+      socket.emit("room-users", userList);
     }
   });
 
   // Handle disconnect
   socket.on("disconnect", () => {
+    console.log("User disconnected:", socket.id);
+
     const user = users.get(socket.id);
-
     if (user) {
-      const { roomCode } = user;
-      const room = rooms.get(roomCode);
-
+      const room = rooms.get(user.roomCode);
       if (room) {
         room.users.delete(socket.id);
 
-        // If room is empty, delete it
-        if (room.users.size === 0) {
-          rooms.delete(roomCode);
-          console.log(`Room ${roomCode} deleted (empty)`);
-        } else {
-          // Notify other users
-          socket.to(roomCode).emit("user-left", {
-            userId: socket.id,
-            users: Array.from(room.users.values()),
-          });
+        // Notify others in room
+        const userList = Array.from(room.users.values()).map((u) => ({
+          name: u.name,
+          socketId: u.socketId,
+          isCreator: u.isCreator,
+        }));
 
-          // If host left, assign new host
-          if (room.host === socket.id) {
-            const newHost = room.users.keys().next().value;
-            room.host = newHost;
-            socket.to(roomCode).emit("new-host", { hostId: newHost });
-          }
-        }
+        socket.to(user.roomCode).emit("user-left", {
+          userName: user.name,
+          socketId: socket.id,
+          users: userList,
+        });
       }
-
       users.delete(socket.id);
     }
 
-    console.log("User disconnected:", socket.id);
+    cleanupRooms();
   });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Voice chat server running on port ${PORT}`);
-  console.log(`Local: http://localhost:${PORT}`);
+  console.log(`Access your app at: http://localhost:${PORT}`);
 });
